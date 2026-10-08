@@ -16,14 +16,12 @@ Petit MCP authentifié pour récupérer du texte public depuis X et inspecter le
 
 ## Page des clés
 
-`/keys` est disponible après connexion GitHub. Les clés API sont chiffrées avec `API_KEYS_ENCRYPTION_KEY` avant stockage dans KV. Les valeurs ne sont jamais renvoyées par l’interface ou les outils.
+`/keys` est protégée par `ADMIN_PAGE_CODE`, indépendamment de la connexion GitHub utilisée par le serveur MCP. Les clés API sont chiffrées avec `API_KEYS_ENCRYPTION_KEY` avant stockage dans KV. Les valeurs ne sont jamais renvoyées par l’interface ou les outils.
 
 Pour l’instant, la page utilise aussi `ADMIN_PAGE_CODE` comme code d’accès privé. Ne mets jamais ce code, une clé API ou un secret GitHub dans le dépôt.
 
 ## Déploiement
 
-Pour créer une instance indépendante, copier `wrangler.example.jsonc` vers `wrangler.jsonc`, puis remplacer le nom du Worker, `PUBLIC_ORIGIN` et l’identifiant KV par ceux de son propre compte Cloudflare. Ne jamais réutiliser le namespace KV d’une autre instance.
+Pour créer une instance indépendante, suivre le [guide complet de déploiement](docs/SETUP.md). Il couvre Cloudflare, GitHub OAuth, les secrets, la connexion ChatGPT et les vérifications. L’agent doit aussi lire les consignes du dépôt dans [`AGENTS.md`](AGENTS.md).
 
-Créer un namespace KV nommé `OAUTH_KV`, puis configurer les secrets requis dans Cloudflare : `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_ALLOWED_LOGIN`, `ADMIN_PAGE_CODE` et `API_KEYS_ENCRYPTION_KEY`. Les valeurs réelles ne doivent jamais être ajoutées au dépôt. Configurer l’URL de callback GitHub OAuth sur `https://<PUBLIC_ORIGIN>/callback`, puis déployer avec `npm run deploy`.
-
-Le fichier local `wrangler.jsonc`, `.dev.vars`, `.wrangler/`, les sauvegardes et les fichiers de test spécifiques à une instance sont exclus du dépôt.
+Le `wrangler.jsonc` local, `.dev.vars`, `.wrangler/`, les sauvegardes et les fichiers de test spécifiques à une instance sont exclus du dépôt. Ne réutilise jamais le Worker ni le namespace KV d’une autre instance.
