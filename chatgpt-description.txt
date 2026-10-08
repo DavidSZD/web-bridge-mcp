@@ -1,0 +1,1 @@
+Use Web Bridge to search YouTube videos and get titles, channels, and links; fetch public web pages and HTML/CSS/JS; read public X/Twitter posts; and call public or configured private APIs, including LLM APIs. API keys stay encrypted and domain-locked.
