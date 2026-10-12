@@ -285,6 +285,126 @@ function rasterFormat(bytes: Uint8Array): { mimeType: "image/png" | "image/jpeg"
   return null;
 }
 
+function imageBytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function assertPublicTweetImageUrl(raw: string): URL {
+  const url = safeUrl(raw);
+  if (url.protocol !== "https:" || url.hostname !== "pbs.twimg.com" || url.username || url.password || !/^\/media\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9]+)?$/.test(url.pathname)) {
+    throw new Error("The media URL is not an allowed public X image URL.");
+  }
+  return url;
+}
+
+async function fetchTweetImageBlock(rawUrl: string) {
+  const url = assertPublicTweetImageUrl(rawUrl);
+  const response = await fetch(url.toString(), {
+    redirect: "manual",
+    headers: {
+      "user-agent": "web-extractor-mcp/0.1",
+      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`Image host returned HTTP ${response.status}.`);
+  }
+  assertPublicTweetImageUrl(response.url || url.toString());
+  if (!response.body) throw new Error("Image host returned an empty response.");
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const format = rasterFormat(bytes);
+  if (!format) throw new Error("The response is not a supported PNG, JPEG, or WebP image.");
+  return { data: imageBytesToBase64(bytes), mimeType: format.mimeType, bytes: totalBytes };
+}
+
+async function getTweetWithImages(url: string) {
+  const overview = await getTweetOverviewTextOnly(url);
+  const posts = overview.structuredContent.posts;
+  const candidates = posts.flatMap((post) => post.mediaItems.map((media) => ({
+    postIndex: post.index,
+    postId: post.id,
+    mediaIndex: media.index,
+    imageUrl: media.imageUrl,
+    altText: media.altText,
+  })));
+  const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
+  const returnedImages: Array<Record<string, unknown>> = [];
+  const failedImages: Array<Record<string, unknown>> = [];
+  let totalBytes = 0;
+
+  for (const candidate of candidates) {
+    try {
+      const image = await fetchTweetImageBlock(candidate.imageUrl);
+      totalBytes += image.bytes;
+      imageBlocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+      returnedImages.push({
+        postIndex: candidate.postIndex,
+        postId: candidate.postId,
+        mediaIndex: candidate.mediaIndex,
+        mimeType: image.mimeType,
+        bytes: image.bytes,
+        altText: candidate.altText,
+      });
+    } catch (error) {
+      failedImages.push({
+        postIndex: candidate.postIndex,
+        mediaIndex: candidate.mediaIndex,
+        reason: error instanceof Error ? error.message : "Image retrieval failed.",
+      });
+    }
+  }
+
+  const imageDelivery = {
+    method: "native_mcp_image_content_blocks",
+    discoveredImageCount: candidates.length,
+    returnedImageCount: imageBlocks.length,
+    totalImageBytes: totalBytes,
+    images: returnedImages,
+    failedImages,
+  };
+  const safePosts = posts.map((post) => ({
+    ...post,
+    mediaItems: post.mediaItems.map(({ imageUrl: _imageUrl, ...media }) => media),
+  }));
+  const structuredContent = {
+    ...overview.structuredContent,
+    posts: safePosts,
+    imageUrlsIncluded: false,
+    imagesIncluded: imageBlocks.length > 0,
+    imageDelivery,
+  };
+  const content = [
+    { type: "text" as const, text: JSON.stringify(structuredContent) },
+    ...imageBlocks,
+  ];
+  return { structuredContent, content };
+}
+
 function decodeOpenRouterImage(value: unknown, declaredMimeType: unknown, remainingBytes: number) {
   if (typeof value !== "string" || !value) throw new Error("OpenRouter returned an image without valid base64 data.");
   const base64 = value.trim();
@@ -433,6 +553,103 @@ async function generateOpenRouterImages(providerName: string | undefined, body: 
     };
   } catch (error) {
     return { isError: true, ...textResult({ provider, status: response.status, error: error instanceof Error ? error.message : "Could not store the generated image." }) };
+  }
+}
+
+// Isolated experiment: return image pixels as native MCP image content blocks.
+// This intentionally does not use R2, the generated-image widget, or uploadFile.
+async function generateOpenRouterImageBlocks(providerName: string | undefined, body: string, env: Env) {
+  let requestPayload: unknown;
+  try { requestPayload = JSON.parse(body); }
+  catch { return { isError: true, ...textResult({ error: "The OpenRouter image request body must be valid JSON." }) }; }
+  if (!requestPayload || typeof requestPayload !== "object" || Array.isArray(requestPayload)) {
+    return { isError: true, ...textResult({ error: "The OpenRouter image request body must be a JSON object." }) };
+  }
+  const model = Reflect.get(requestPayload, "model");
+  const prompt = Reflect.get(requestPayload, "prompt");
+  if (typeof model !== "string" || !model.trim() || typeof prompt !== "string" || !prompt.trim()) {
+    return { isError: true, ...textResult({ error: "The OpenRouter image request must include non-empty model and prompt fields." }) };
+  }
+
+  let provider: string;
+  let config: ApiProviderConfig;
+  try {
+    const resolved = await configuredOpenRouterProvider(providerName, env);
+    provider = resolved.provider;
+    config = resolved.config;
+  } catch (error) {
+    return { isError: true, ...textResult({ error: error instanceof Error ? error.message : "Could not resolve an OpenRouter provider." }) };
+  }
+
+  const headers: Record<string, string> = { accept: "application/json", "content-type": "application/json" };
+  headers[config.auth === "bearer" ? "authorization" : "x-api-key"] = config.auth === "bearer" ? `Bearer ${config.key}` : config.key;
+  let response: Response;
+  let text: string;
+  try {
+    ({ response, text } = await limitedFetch("https://openrouter.ai/api/v1/images", MAX_OPENROUTER_IMAGE_RESPONSE_BYTES, {
+      method: "POST",
+      headers,
+      body,
+    }));
+  } catch (error) {
+    return { isError: true, ...textResult({ provider, error: error instanceof Error ? error.message : "OpenRouter image generation request failed." }) };
+  }
+
+  if (!response.ok) {
+    let apiError: string | undefined;
+    try {
+      const errorPayload: unknown = JSON.parse(text);
+      if (errorPayload && typeof errorPayload === "object") {
+        const detail = Reflect.get(errorPayload, "error");
+        const message = Reflect.get(errorPayload, "message");
+        const nested = detail && typeof detail === "object" ? Reflect.get(detail, "message") : undefined;
+        const candidate = typeof detail === "string" ? detail : nested ?? message;
+        if (typeof candidate === "string") apiError = candidate.slice(0, 500);
+      }
+    } catch { /* Keep upstream error responses bounded and avoid echoing arbitrary bodies. */ }
+    return { isError: true, ...textResult({ provider, status: response.status, error: apiError ?? "OpenRouter image generation failed." }) };
+  }
+
+  let payload: unknown;
+  try { payload = JSON.parse(text); }
+  catch { return { isError: true, ...textResult({ provider, status: response.status, error: "OpenRouter returned a non-JSON response for image generation." }) }; }
+  if (!payload || typeof payload !== "object" || !("data" in payload) || !Array.isArray(payload.data)) {
+    return { isError: true, ...textResult({ provider, status: response.status, error: "OpenRouter did not return the expected image-generation response." }) };
+  }
+  if (payload.data.length === 0) {
+    return { isError: true, ...textResult({ provider, status: response.status, error: "OpenRouter returned no base64 image output in data[].b64_json." }) };
+  }
+
+  try {
+    const selected = payload.data.slice(0, MAX_GENERATED_IMAGES_PER_RESPONSE) as OpenRouterImagePayload[];
+    let totalImageBytes = 0;
+    const images: Array<{ index: number; mimeType: "image/png" | "image/jpeg" | "image/webp"; bytes: number }> = [];
+    const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    for (const [index, item] of selected.entries()) {
+      const decoded = decodeOpenRouterImage(item.b64_json, item.media_type, MAX_GENERATED_IMAGES_BYTES - totalImageBytes);
+      totalImageBytes += decoded.bytes.byteLength;
+      images.push({ index: index + 1, mimeType: decoded.mimeType, bytes: decoded.bytes.byteLength });
+      imageBlocks.push({ type: "image", data: imageBytesToBase64(decoded.bytes), mimeType: decoded.mimeType });
+    }
+    const structuredContent = {
+      provider,
+      model,
+      delivery: "native_mcp_image_content_blocks" as const,
+      imagesIncluded: imageBlocks.length > 0,
+      imageCount: imageBlocks.length,
+      omittedImageCount: Math.max(0, payload.data.length - selected.length),
+      totalImageBytes,
+      images,
+    };
+    return {
+      structuredContent,
+      content: [
+        { type: "text" as const, text: JSON.stringify(structuredContent) },
+        ...imageBlocks,
+      ],
+    };
+  } catch (error) {
+    return { isError: true, ...textResult({ provider, status: response.status, error: error instanceof Error ? error.message : "Could not prepare OpenRouter image blocks." }) };
   }
 }
 
@@ -839,7 +1056,9 @@ async function fetchFxThread(url: string, maxPosts = 30): Promise<FxThreadData> 
   };
 }
 
-async function getTweetOverview(url: string) {
+// Rollback archive: this is the former text + image-URL-only result. To revert,
+// register get_tweet with this handler instead of getTweetWithImages.
+async function getTweetOverviewTextOnly(url: string) {
   let data: FxThreadData;
   try {
     data = await fetchFxThread(url, 30);
@@ -1008,13 +1227,31 @@ function createServer(env: Env) {
   }));
 
   server.registerTool("get_tweet", {
-    title: "Fetch X post or thread manifest",
-    description: "Primary tool for any public X/Twitter status URL. Automatically detects a single post or thread and retrieves all available post text.",
+    title: "Get X/Twitter post",
+    description: `Fetches text and attached images from a public X/Twitter post or thread. Use this exact single-call extraction:
+const r = await tools.mcp__Web_bridge__get_tweet({ url });
+
+if (r?.structuredContent != null) {
+  text(JSON.stringify(r.structuredContent));
+}
+
+const items = [
+  ...(Array.isArray(r?.content_items) ? r.content_items : []),
+  ...(Array.isArray(r?.content) ? r.content : [])
+];
+
+for (const item of items) {
+  if (item?.type === "image") {
+    image(item);
+  } else if (typeof item?.text === "string") {
+    text(item.text);
+  }
+}`,
     inputSchema: {
       url: z.string().url().describe("Public X/Twitter status URL; a Markdown link is also accepted."),
     },
   ...readMeta,
-  }, async ({ url }) => getTweetOverview(url));
+  }, async ({ url }) => getTweetWithImages(url));
 
   server.registerTool("get_page_code", {
     title: "Get public page code",
@@ -1044,6 +1281,31 @@ function createServer(env: Env) {
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ provider, body }) => generateOpenRouterImages(provider, body, env));
+
+  server.registerTool("generate_openrouter_image_exp", {
+    title: "Experimental: Generate image as MCP blocks",
+    description: "EXPERIMENTAL DELIVERY TEST. Use only when the user explicitly asks to test direct MCP image-block delivery or names this experimental tool. Generates through the configured OpenRouter provider and returns the actual pixels as native MCP image content blocks. It does not store images in R2, open a widget, call uploadFile, or attach files. For ordinary image-generation requests, keep using generate_openrouter_image. After a successful call, do not invoke any upload or image-display tool; use the returned image blocks directly. Never use Web Search or add images found on the internet. Do not describe or analyze the generated image unless the user explicitly asks.",
+    inputSchema: {
+      provider: z.string().regex(/^[a-zA-Z0-9._-]{1,50}$/).optional().describe("Exact configured provider name for OpenRouter. Omit if only one OpenRouter provider is configured."),
+      body: z.string().min(2).max(100_000).describe("JSON request body accepted by OpenRouter /api/v1/images; include the model, prompt, and supported options such as n or size."),
+    },
+    outputSchema: {
+      provider: z.string(),
+      model: z.string(),
+      delivery: z.literal("native_mcp_image_content_blocks"),
+      imagesIncluded: z.boolean(),
+      imageCount: z.number().int().nonnegative(),
+      omittedImageCount: z.number().int().nonnegative(),
+      totalImageBytes: z.number().int().nonnegative(),
+      images: z.array(z.object({
+        index: z.number().int().positive(),
+        mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+        bytes: z.number().int().positive(),
+      })),
+    },
+    ...readMeta,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async ({ provider, body }) => generateOpenRouterImageBlocks(provider, body, env));
 
   server.registerTool("search_youtube_videos", {
     title: "Search YouTube videos",
