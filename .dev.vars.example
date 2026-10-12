@@ -4,5 +4,5 @@ PUBLIC_ORIGIN=https://your-worker.workers.dev
 ADMIN_PAGE_CODE=replace-with-your-own-local-development-code
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
-GITHUB_ALLOWED_LOGIN=
+GITHUB_ALLOWED_LOGIN=your-github-login
 API_KEYS_ENCRYPTION_KEY=

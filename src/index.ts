@@ -13,6 +13,7 @@ type Env = {
   GITHUB_ALLOWED_LOGINS?: string;
   ADMIN_PAGE_CODE?: string;
   API_KEYS_ENCRYPTION_KEY?: string;
+  GENERATED_IMAGES?: R2Bucket;
 };
 
 type ApiProviderConfig = {
@@ -26,9 +27,16 @@ const STATE_COOKIE = "__Host-web-extractor-state";
 const ADMIN_COOKIE = "__Host-web-extractor-admin";
 const TTL = 600;
 const MAX_PAGE_BYTES = 600_000;
+const MAX_OPENROUTER_IMAGE_RESPONSE_BYTES = 24_000_000;
+const MAX_GENERATED_IMAGE_BYTES = 12_000_000;
+const MAX_GENERATED_IMAGES_BYTES = 16_000_000;
+const MAX_GENERATED_IMAGES_PER_RESPONSE = 10;
+const GENERATED_IMAGE_RETENTION_DAYS = 30;
+const CHATGPT_WIDGET_ORIGIN = "https://web-extractor-mcp-flights-tracker-workers-dev.web-sandbox.oaiusercontent.com";
 const MAX_YOUTUBE_SEARCH_BYTES = 2_200_000;
 const MAX_ASSET_BYTES = 250_000;
 const PROVIDER_UI_URI = "ui://web-bridge/providers-v4.html";
+const GENERATED_IMAGES_UI_URI = "ui://web-bridge/generated-images-v6.html";
 
 const providerWidgetHtml = (workerOrigin: string) => `<!doctype html>
 <html lang="fr">
@@ -45,6 +53,91 @@ const providerWidgetHtml = (workerOrigin: string) => `<!doctype html>
   <iframe title="Gestion des providers et des clés Web Bridge" src="${workerOrigin}/keys?embedded=1"></iframe>
 </body>
 </html>`;
+
+function generatedImagesWidgetHtml(workerOrigin: string) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+    *{box-sizing:border-box}html,body{width:100%;min-width:0;margin:0;padding:0;background:transparent}body{overflow:hidden}.images{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:4px;width:fit-content;max-width:100%;margin:0 auto;padding:0}.images img{display:block;flex:0 1 auto;width:auto;max-width:min(512px,100%);max-height:512px;height:auto;margin:0;padding:0;border-radius:8px;object-fit:contain}
+    </style></head><body><main id="images" class="images" aria-label="Generated images"></main><script>
+    const workerOrigin=${JSON.stringify(workerOrigin)};
+    const metadataKey="web-bridge/generated-images";
+    const gallery=document.getElementById("images");
+    let renderedKey="";
+    let attemptedUploadKey="";
+    function extractImages(){
+      const api=window.openai;
+      const response=api?.toolResponseMetadata;
+      const candidates=[response?.mcp_tool_result,response?.call_tool_result,response?.mcp_tool_result?.result,response?.call_tool_result?.result,response,api?.toolOutput];
+      for(const candidate of candidates){
+        if(!candidate||typeof candidate!=="object")continue;
+        const result=candidate;
+        const nested=result.result&&typeof result.result==="object"?result.result:null;
+        const meta=result._meta||nested?._meta;
+        const images=meta?.[metadataKey]||result[metadataKey]||nested?.[metadataKey];
+        if(Array.isArray(images))return images;
+      }
+      return [];
+    }
+    function safeImages(){
+      return extractImages().filter((item)=>{
+        if(!item||typeof item.imageUrl!=="string")return false;
+        try{
+          const url=new URL(item.imageUrl);
+          return url.origin===workerOrigin&&/^\\/generated\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(png|jpg|webp)$/i.test(url.pathname)&&["image/png","image/jpeg","image/webp"].includes(item.mimeType);
+        }catch{return false}
+      });
+    }
+    async function uploadImages(images,key){
+      const api=window.openai;
+      if(attemptedUploadKey===key)return;
+      const state=api?.widgetState;
+      const privateContent=state?.privateContent;
+      if(privateContent&&typeof privateContent==="object"&&privateContent.webBridgeSourceKey===key)return;
+      attemptedUploadKey=key;
+      if(!api?.uploadFile||!api?.setWidgetState){console.error("Web Bridge: automatic image attachment is unavailable in this ChatGPT client.");return;}
+      const imageIds=[];
+      for(let index=0;index<images.length;index++){
+        const image=images[index];
+        try{
+          const response=await fetch(image.imageUrl,{mode:"cors",credentials:"omit",cache:"no-store"});
+          if(!response.ok)throw new Error("Image fetch failed with HTTP "+response.status);
+          const blob=await response.blob();
+          const mimeType=["image/png","image/jpeg","image/webp"].includes(blob.type)?blob.type:image.mimeType;
+          if(mimeType!==image.mimeType)throw new Error("Downloaded image MIME type does not match the generated image.");
+          const extension=mimeType==="image/jpeg"?"jpg":mimeType.slice("image/".length);
+          const file=new File([blob],"web-bridge-generated-"+(index+1)+"."+extension,{type:mimeType});
+          const uploaded=await api.uploadFile(file,{library:false});
+          if(!uploaded?.fileId)throw new Error("ChatGPT did not return a file ID.");
+          imageIds.push(uploaded.fileId);
+        }catch(error){console.error("Web Bridge: generated image attachment failed.",error);}
+      }
+      if(imageIds.length){
+        api.setWidgetState({
+          modelContent:"After this image-generation call, output exactly one working Markdown link for each entry in structuredContent.downloadLinks, using its exact url and index in this format: [Télécharger l’image N](URL). Never output an empty link or button. Do not use imageUrl as the download target. Do not add prose, status updates, or claims about whether the image was received, visible, or attached. Do not browse the web or add images found on the internet. Analyze the generated image only if the user explicitly asks.",
+          privateContent:{webBridgeSourceKey:key},
+          imageIds,
+        });
+      }
+    }
+    function render(){
+      const images=safeImages();
+      if(!images.length)return;
+      const key=images.map((item)=>item.imageUrl).join("|");
+      if(renderedKey===key)return;
+      renderedKey=key;
+      gallery.dataset.count=String(images.length);
+      gallery.replaceChildren(...images.map((item,index)=>{
+        const image=document.createElement("img");
+        image.alt="Generated image "+(index+1);
+        image.decoding="async";
+        image.src=item.imageUrl;
+        return image;
+      }));
+      void uploadImages(images,key);
+    }
+    window.addEventListener("openai:set_globals",render);
+    render();
+    </script></body></html>`;
+}
 
 type TweetRecord = {
   source: string;
@@ -149,11 +242,239 @@ function linkedAssets(html: string, pageUrl: URL) {
 async function limitedFetch(url: string, limit: number, init?: RequestInit) {
   const response = await fetch(url, { ...init, redirect: "follow", headers: { "user-agent": "web-extractor-mcp/0.1", ...(init?.headers ?? {}) } });
   const length = Number(response.headers.get("content-length") ?? 0);
-  if (length > limit) throw new Error(`Response is larger than the ${limit} byte safety limit.`);
-  const text = await response.text();
-  if (new TextEncoder().encode(text).byteLength > limit) throw new Error(`Response is larger than the ${limit} byte safety limit.`);
+  if (length > limit) {
+    await response.body?.cancel();
+    throw new Error(`Response is larger than the ${limit} byte safety limit.`);
+  }
+  if (!response.body) return { response, text: "" };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > limit) {
+        await reader.cancel();
+        throw new Error(`Response is larger than the ${limit} byte safety limit.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  const text = new TextDecoder().decode(bytes);
   return { response, text };
 }
+
+type OpenRouterImagePayload = { b64_json?: unknown; media_type?: unknown };
+type StoredGeneratedImage = { imageUrl: string; downloadUrl: string; mimeType: "image/png" | "image/jpeg" | "image/webp"; bytes: number; expiresAt: string };
+
+function isOpenRouterImageEndpoint(url: URL, method: string) {
+  return method === "POST" && url.hostname === "openrouter.ai" && url.pathname.replace(/\/+$/, "") === "/api/v1/images";
+}
+
+function rasterFormat(bytes: Uint8Array): { mimeType: "image/png" | "image/jpeg" | "image/webp"; extension: "png" | "jpg" | "webp" } | null {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return { mimeType: "image/png", extension: "png" };
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return { mimeType: "image/jpeg", extension: "jpg" };
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF" && String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP") return { mimeType: "image/webp", extension: "webp" };
+  return null;
+}
+
+function decodeOpenRouterImage(value: unknown, declaredMimeType: unknown, remainingBytes: number) {
+  if (typeof value !== "string" || !value) throw new Error("OpenRouter returned an image without valid base64 data.");
+  const base64 = value.trim();
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length % 4 === 1) throw new Error("OpenRouter returned malformed image data.");
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const estimatedBytes = Math.floor(base64.length * 3 / 4) - padding;
+  if (estimatedBytes <= 0 || estimatedBytes > MAX_GENERATED_IMAGE_BYTES || estimatedBytes > remainingBytes) throw new Error("Generated image output exceeds the Web Bridge storage safety limit.");
+  let binary: string;
+  try { binary = atob(base64); } catch { throw new Error("OpenRouter returned malformed image data."); }
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const format = rasterFormat(bytes);
+  if (!format) throw new Error("This OpenRouter output is not a supported PNG, JPEG, or WebP raster image.");
+  if (declaredMimeType !== undefined && declaredMimeType !== null && declaredMimeType !== format.mimeType) throw new Error("OpenRouter image MIME metadata does not match the returned file.");
+  return { bytes, ...format };
+}
+
+async function storeOpenRouterImages(payload: unknown, env: Env): Promise<StoredGeneratedImage[]> {
+  if (!env.GENERATED_IMAGES) throw new Error("Generated-image storage is not configured. Bind an R2 bucket as GENERATED_IMAGES.");
+  if (!payload || typeof payload !== "object" || !("data" in payload) || !Array.isArray(payload.data)) throw new Error("OpenRouter did not return the expected image-generation response.");
+  const items = payload.data as OpenRouterImagePayload[];
+  if (items.length === 0) throw new Error("OpenRouter returned no base64 image output in data[].b64_json.");
+  const selected = items.slice(0, MAX_GENERATED_IMAGES_PER_RESPONSE);
+  const expiresAt = new Date(Date.now() + GENERATED_IMAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const publicOrigin = origin(env);
+  const stored: Array<{ key: string; image: StoredGeneratedImage }> = [];
+  let totalBytes = 0;
+  try {
+    for (const item of selected) {
+      const decoded = decodeOpenRouterImage(item.b64_json, item.media_type, MAX_GENERATED_IMAGES_BYTES - totalBytes);
+      const id = crypto.randomUUID();
+      const key = `generated/${id}.${decoded.extension}`;
+      await env.GENERATED_IMAGES.put(key, decoded.bytes, {
+        httpMetadata: { contentType: decoded.mimeType, cacheControl: "private, max-age=300" },
+        customMetadata: { expiresAt },
+      });
+      totalBytes += decoded.bytes.byteLength;
+      const imageUrl = `${publicOrigin}/${key}`;
+      stored.push({ key, image: { imageUrl, downloadUrl: `${imageUrl}?download=1`, mimeType: decoded.mimeType, bytes: decoded.bytes.byteLength, expiresAt } });
+    }
+  } catch (error) {
+    await Promise.allSettled(stored.map(({ key }) => env.GENERATED_IMAGES!.delete(key)));
+    throw error;
+  }
+  return stored.map(({ image }) => image);
+}
+
+async function configuredOpenRouterProvider(providerName: string | undefined, env: Env) {
+  if (providerName) {
+    const config = await apiKey(providerName, env);
+    if (new URL(config.baseUrl).origin !== "https://openrouter.ai") {
+      throw new Error(`Provider '${providerName}' is not configured for OpenRouter.`);
+    }
+    return { provider: providerName.toLowerCase(), config };
+  }
+
+  const listing = await env.OAUTH_KV.list({ prefix: "api-key:", limit: 1000 });
+  const matches: string[] = [];
+  for (const entry of listing.keys) {
+    const name = entry.name.slice("api-key:".length);
+    try {
+      const config = await storedProvider(name, env);
+      if (config?.key && new URL(config.baseUrl).origin === "https://openrouter.ai") matches.push(name);
+    } catch { /* Ignore malformed unrelated provider records. */ }
+  }
+  if (!listing.list_complete) throw new Error("Too many providers are configured to resolve OpenRouter automatically; specify its provider name.");
+  if (matches.length === 0) throw new Error("No configured provider with an API key uses https://openrouter.ai.");
+  if (matches.length > 1) throw new Error("More than one OpenRouter provider is configured; specify the provider name to use.");
+  const provider = matches[0];
+  return { provider, config: await apiKey(provider, env) };
+}
+
+async function generateOpenRouterImages(providerName: string | undefined, body: string, env: Env) {
+  if (!env.GENERATED_IMAGES) {
+    return { isError: true, ...textResult({ error: "Image generation is not available because generated-image storage is not configured." }) };
+  }
+
+  let requestPayload: unknown;
+  try { requestPayload = JSON.parse(body); }
+  catch { return { isError: true, ...textResult({ error: "The OpenRouter image request body must be valid JSON." }) }; }
+  if (!requestPayload || typeof requestPayload !== "object" || Array.isArray(requestPayload)) {
+    return { isError: true, ...textResult({ error: "The OpenRouter image request body must be a JSON object." }) };
+  }
+  const model = Reflect.get(requestPayload, "model");
+  const prompt = Reflect.get(requestPayload, "prompt");
+  if (typeof model !== "string" || !model.trim() || typeof prompt !== "string" || !prompt.trim()) {
+    return { isError: true, ...textResult({ error: "The OpenRouter image request must include non-empty model and prompt fields." }) };
+  }
+
+  let provider: string;
+  let config: ApiProviderConfig;
+  try {
+    const resolved = await configuredOpenRouterProvider(providerName, env);
+    provider = resolved.provider;
+    config = resolved.config;
+  } catch (error) {
+    return { isError: true, ...textResult({ error: error instanceof Error ? error.message : "Could not resolve an OpenRouter provider." }) };
+  }
+
+  const headers: Record<string, string> = { accept: "application/json", "content-type": "application/json" };
+  headers[config.auth === "bearer" ? "authorization" : "x-api-key"] = config.auth === "bearer" ? `Bearer ${config.key}` : config.key;
+  let response: Response;
+  let text: string;
+  try {
+    ({ response, text } = await limitedFetch("https://openrouter.ai/api/v1/images", MAX_OPENROUTER_IMAGE_RESPONSE_BYTES, {
+      method: "POST",
+      headers,
+      body,
+    }));
+  } catch (error) {
+    return { isError: true, ...textResult({ provider, error: error instanceof Error ? error.message : "OpenRouter image generation request failed." }) };
+  }
+
+  if (!response.ok) {
+    let apiError: string | undefined;
+    try {
+      const errorPayload: unknown = JSON.parse(text);
+      if (errorPayload && typeof errorPayload === "object") {
+        const detail = Reflect.get(errorPayload, "error");
+        const message = Reflect.get(errorPayload, "message");
+        const nested = detail && typeof detail === "object" ? Reflect.get(detail, "message") : undefined;
+        const candidate = typeof detail === "string" ? detail : nested ?? message;
+        if (typeof candidate === "string") apiError = candidate.slice(0, 500);
+      }
+    } catch { /* Keep upstream error responses bounded and avoid echoing arbitrary bodies. */ }
+    return { isError: true, ...textResult({ provider, status: response.status, error: apiError ?? "OpenRouter image generation failed." }) };
+  }
+
+  let payload: unknown;
+  try { payload = JSON.parse(text); }
+  catch { return { isError: true, ...textResult({ provider, status: response.status, error: "OpenRouter returned a non-JSON response for image generation." }) }; }
+  try {
+    const images = await storeOpenRouterImages(payload, env);
+    const downloadLinks = images.map((image, index) => ({
+      index: index + 1,
+      url: image.downloadUrl,
+      mimeType: image.mimeType,
+      bytes: image.bytes,
+    }));
+    return {
+      content: [{
+        type: "text" as const,
+        text: downloadLinks.map(({ index, url }) => `[Télécharger l’image ${index}](${url})`).join("\n"),
+      }],
+      structuredContent: { downloadLinks },
+      _meta: { "web-bridge/generated-images": images },
+    };
+  } catch (error) {
+    return { isError: true, ...textResult({ provider, status: response.status, error: error instanceof Error ? error.message : "Could not store the generated image." }) };
+  }
+}
+
+async function generatedImage(request: Request, env: Env) {
+  if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405, headers: { allow: "GET, HEAD" } });
+  if (!env.GENERATED_IMAGES) return new Response("Generated-image storage is not configured.", { status: 503 });
+  const url = new URL(request.url);
+  const match = url.pathname.match(/^\/generated\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(png|jpg|webp)$/i);
+  if (!match) return new Response("Not found", { status: 404 });
+  const id = match[1].toLowerCase();
+  const extension = match[2].toLowerCase();
+  const key = `generated/${id}.${extension}`;
+  const object = await env.GENERATED_IMAGES.get(key);
+  if (!object) return new Response("Image not found or expired.", { status: 404 });
+  const expiresAt = object.customMetadata?.expiresAt;
+  if (expiresAt && Date.parse(expiresAt) <= Date.now()) {
+    await env.GENERATED_IMAGES.delete(key);
+    return new Response("Image expired.", { status: 410 });
+  }
+  const mimeType = extension === "jpg" ? "image/jpeg" : `image/${extension}`;
+  const filename = `web-bridge-${id}.${extension}`;
+  const headers = new Headers({
+    "content-type": mimeType,
+    "content-length": String(object.size),
+    "content-disposition": `${url.searchParams.get("download") === "1" ? "attachment" : "inline"}; filename="${filename}"`,
+    "cache-control": "private, max-age=300",
+    "x-content-type-options": "nosniff",
+    "cross-origin-resource-policy": "cross-origin",
+  });
+  // Allow the ChatGPT MCP widget to fetch generated images for automatic file attachment.
+  if (request.headers.get("origin") === CHATGPT_WIDGET_ORIGIN) {
+    headers.set("access-control-allow-origin", CHATGPT_WIDGET_ORIGIN);
+    headers.append("vary", "Origin");
+  }
+  if (object.httpEtag) headers.set("etag", object.httpEtag);
+  if (request.method === "HEAD") {
+    await object.body.cancel();
+    return new Response(null, { headers });
+  }
+  return new Response(object.body, { headers });
+}
+
 function tweetId(url: string): string | null { return url.match(/status(?:es)?\/(\d+)/i)?.[1] ?? null; }
 
 type YouTubeVideo = {
@@ -644,7 +965,7 @@ async function configuredApiProviders(env: Env) {
 }
 
 function createServer(env: Env) {
-  const server = new McpServer({ name: "web-bridge", version: "0.6.0" });
+  const server = new McpServer({ name: "web-bridge", version: "0.7.0" });
   const readMeta = {
     _meta: { securitySchemes: [{ type: "oauth2", scopes: ["mcp:read"] }] },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -668,6 +989,23 @@ function createServer(env: Env) {
       },
     }],
   }));
+  server.registerResource("generated-image-gallery", GENERATED_IMAGES_UI_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
+    contents: [{
+      uri: GENERATED_IMAGES_UI_URI,
+      mimeType: "text/html;profile=mcp-app",
+      text: generatedImagesWidgetHtml(origin(env)),
+      _meta: {
+        ui: {
+          prefersBorder: false,
+          domain: origin(env),
+          csp: { connectDomains: [origin(env)], resourceDomains: [origin(env)], frameDomains: [] },
+        },
+        "openai/widgetPrefersBorder": false,
+        "openai/ui": { availableDisplayModes: ["inline"] },
+        "openai/widgetDescription": "Displays only the generated image(s), without labels, download controls, or status text. The assistant should return only the download link(s) supplied by the tool, without process narration. Never add images found on the internet.",
+      },
+    }],
+  }));
 
   server.registerTool("get_tweet", {
     title: "Fetch X post or thread manifest",
@@ -684,6 +1022,28 @@ function createServer(env: Env) {
     inputSchema: { url: z.string().url(), includeAssets: z.boolean().default(true) },
     ...readMeta,
   }, async ({ url, includeAssets }) => textResult(await pageCode(url, includeAssets)));
+
+  server.registerTool("generate_openrouter_image", {
+    title: "Generate image with OpenRouter",
+    description: "Use only when the user explicitly asks to generate an image through Web Bridge/OpenRouter or names their configured OpenRouter API. Uses the encrypted server-side key, calls OpenRouter's image endpoint, stores every returned raster image in Web Bridge, displays the image(s) in an image-only widget, and automatically attempts to attach them to ChatGPT when uploadFile is available. After success, output exactly one working Markdown link per structuredContent.downloadLinks entry, copying its exact URL: [Télécharger l’image N](URL). Never output an empty link or button. Do not add prose, status updates, or claims about whether the image was generated, received, visible, or attached. Never use Web Search or another browsing/image-search tool for this generation request, and never add or return images found on the internet. Do not analyze or describe the generated image unless the user explicitly asks. If the tool returns an error, state only the concise actionable error. Do not use call_configured_api for image generation.",
+    inputSchema: {
+      provider: z.string().regex(/^[a-zA-Z0-9._-]{1,50}$/).optional().describe("Exact configured provider name for OpenRouter. Omit if only one OpenRouter provider is configured."),
+      body: z.string().min(2).max(100_000).describe("JSON request body accepted by OpenRouter /api/v1/images; include the model, prompt, and any supported options such as n or size."),
+    },
+    outputSchema: {
+      downloadLinks: z.array(z.object({
+        index: z.number().int().positive(),
+        url: z.string().url(),
+        mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+        bytes: z.number().int().positive(),
+      })),
+    },
+    _meta: {
+      ...readMeta._meta,
+      ui: { resourceUri: GENERATED_IMAGES_UI_URI },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async ({ provider, body }) => generateOpenRouterImages(provider, body, env));
 
   server.registerTool("search_youtube_videos", {
     title: "Search YouTube videos",
@@ -763,13 +1123,17 @@ function createServer(env: Env) {
 
   server.registerTool("call_configured_api", {
     title: "Call configured API",
-    description: "PRIVATE API ACTION. Call a configured provider with its server-side key only when the user explicitly requests a private/API-key-backed call. Never use a specific private API unless the user explicitly asks to use that API. The URL must stay on the provider base origin; keys are never returned.",
+    description: "PRIVATE API ACTION. Call a configured provider with its server-side key only when the user explicitly requests a private/API-key-backed call. Never use a specific private API unless the user explicitly asks to use that API. The URL must stay on the provider base origin; keys are never returned. Do not use this generic tool for OpenRouter image generation; use generate_openrouter_image so the generated image is displayed and attached automatically.",
     inputSchema: { provider: z.string().regex(/^[a-zA-Z0-9._-]{1,50}$/), url: z.string().url(), method: z.enum(["GET", "POST"]).default("GET"), body: z.string().max(100_000).optional() },
-    ...readMeta,
+    _meta: readMeta._meta,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async ({ provider, url, method, body }) => {
     const configured = await apiKey(provider, env);
     const target = safeUrl(url);
     if (target.origin !== new URL(configured.baseUrl).origin) throw new Error(`URL is outside the configured origin for '${provider}'.`);
+    if (isOpenRouterImageEndpoint(target, method)) {
+      return { isError: true, ...textResult({ error: "Use generate_openrouter_image for OpenRouter image generation so the image-only widget can display and attach the result." }) };
+    }
     const headers: Record<string, string> = { accept: "application/json,text/plain,*/*", "content-type": "application/json" };
     headers[configured.auth === "bearer" ? "authorization" : "x-api-key"] = configured.auth === "bearer" ? `Bearer ${configured.key}` : configured.key;
     const { response, text } = await limitedFetch(target.toString(), MAX_PAGE_BYTES, { method, headers, body: method === "POST" ? body : undefined });
@@ -999,10 +1363,11 @@ async function keysPost(request: Request, env: Env) {
 function authError(error: unknown): Response { if (!(error instanceof AuthorizationError)) throw error; if (!error.redirectUri) return new Response(error.description, { status: 400 }); const redirect = new URL(error.redirectUri); redirect.searchParams.set("error", error.code); redirect.searchParams.set("error_description", error.description); if (error.state) redirect.searchParams.set("state", error.state); return Response.redirect(redirect, 302); }
 const STATE_COOKIE_NAME = STATE_COOKIE;
 function allowed(env: Env) { return new Set([env.GITHUB_ALLOWED_LOGIN, ...(env.GITHUB_ALLOWED_LOGINS ?? "").split(",")].map((x) => x?.trim().toLowerCase()).filter(Boolean)); }
+function ownerLoginConfigured(env: Env) { return Boolean(env.GITHUB_ALLOWED_LOGIN?.trim()); }
 function stateCookie(value: string, maxAge = TTL) { return cookieHeader(STATE_COOKIE_NAME, value, maxAge); }
 function randomToken() { const bytes = crypto.getRandomValues(new Uint8Array(32)); return [...bytes].map((x) => x.toString(16).padStart(2, "0")).join(""); }
-async function authorize(request: Request, env: Env) { if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return new Response("GitHub OAuth is not configured.", { status: 503 }); let authRequest: AuthRequest; try { authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request); } catch (e) { return authError(e); } const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId); if (!client) return new Response("Unknown OAuth client", { status: 400 }); const state = randomToken(); await env.OAUTH_KV.put(`github-state:${state}`, JSON.stringify(authRequest), { expirationTtl: TTL }); const github = new URL("https://github.com/login/oauth/authorize"); github.searchParams.set("client_id", env.GITHUB_CLIENT_ID); github.searchParams.set("redirect_uri", `${origin(env)}/callback`); github.searchParams.set("scope", "read:user"); github.searchParams.set("state", state); return new Response(null, { status: 302, headers: { Location: github.toString(), "set-cookie": stateCookie(state) } }); }
-async function callback(request: Request, env: Env) { const url = new URL(request.url); const state = url.searchParams.get("state"); const code = url.searchParams.get("code"); if (!state || !code || cookie(request, STATE_COOKIE_NAME) !== state) return new Response("Invalid OAuth callback", { status: 400 }); const stored = await env.OAUTH_KV.get(`github-state:${state}`); await env.OAUTH_KV.delete(`github-state:${state}`); if (!stored) return new Response("OAuth request expired", { status: 400 }); const tokenResponse = await fetch("https://github.com/login/oauth/access_token", { method: "POST", headers: { accept: "application/json", "content-type": "application/json" }, body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code, redirect_uri: `${origin(env)}/callback` }) }); const token = await tokenResponse.json() as { access_token?: string }; if (!token.access_token) return new Response("GitHub authentication failed", { status: 502 }); const userResponse = await fetch("https://api.github.com/user", { headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token.access_token}`, "user-agent": "web-extractor-mcp" } }); const user = await userResponse.json() as { id?: number; login?: string }; if (!user.id || !user.login) return new Response("Could not identify GitHub account", { status: 502 }); const allowlist = allowed(env); if (allowlist.size && !allowlist.has(user.login.toLowerCase())) return new Response("GitHub account is not allowed", { status: 403 }); const authRequest = JSON.parse(stored) as AuthRequest; const result = await env.OAUTH_PROVIDER.completeAuthorization({ request: authRequest, userId: String(user.id), metadata: { githubLogin: user.login }, scope: authRequest.scope.filter((x) => x === "mcp:read"), props: { githubLogin: user.login, githubId: user.id } }); return new Response(null, { status: 302, headers: { Location: result.redirectTo, "set-cookie": stateCookie("", 0) } }); }
+async function authorize(request: Request, env: Env) { if (!ownerLoginConfigured(env)) return new Response("GITHUB_ALLOWED_LOGIN is not configured.", { status: 503 }); if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) return new Response("GitHub OAuth is not configured.", { status: 503 }); let authRequest: AuthRequest; try { authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request); } catch (e) { return authError(e); } const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId); if (!client) return new Response("Unknown OAuth client", { status: 400 }); const state = randomToken(); await env.OAUTH_KV.put(`github-state:${state}`, JSON.stringify(authRequest), { expirationTtl: TTL }); const github = new URL("https://github.com/login/oauth/authorize"); github.searchParams.set("client_id", env.GITHUB_CLIENT_ID); github.searchParams.set("redirect_uri", `${origin(env)}/callback`); github.searchParams.set("scope", "read:user"); github.searchParams.set("state", state); return new Response(null, { status: 302, headers: { Location: github.toString(), "set-cookie": stateCookie(state) } }); }
+async function callback(request: Request, env: Env) { if (!ownerLoginConfigured(env)) return new Response("GITHUB_ALLOWED_LOGIN is not configured.", { status: 503 }); const allowlist = allowed(env); const url = new URL(request.url); const state = url.searchParams.get("state"); const code = url.searchParams.get("code"); if (!state || !code || cookie(request, STATE_COOKIE_NAME) !== state) return new Response("Invalid OAuth callback", { status: 400 }); const stored = await env.OAUTH_KV.get(`github-state:${state}`); await env.OAUTH_KV.delete(`github-state:${state}`); if (!stored) return new Response("OAuth request expired", { status: 400 }); const tokenResponse = await fetch("https://github.com/login/oauth/access_token", { method: "POST", headers: { accept: "application/json", "content-type": "application/json" }, body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code, redirect_uri: `${origin(env)}/callback` }) }); const token = await tokenResponse.json() as { access_token?: string }; if (!token.access_token) return new Response("GitHub authentication failed", { status: 502 }); const userResponse = await fetch("https://api.github.com/user", { headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token.access_token}`, "user-agent": "web-extractor-mcp" } }); const user = await userResponse.json() as { id?: number; login?: string }; if (!user.id || !user.login) return new Response("Could not identify GitHub account", { status: 502 }); if (!allowlist.has(user.login.toLowerCase())) return new Response("GitHub account is not allowed", { status: 403 }); const authRequest = JSON.parse(stored) as AuthRequest; const result = await env.OAUTH_PROVIDER.completeAuthorization({ request: authRequest, userId: String(user.id), metadata: { githubLogin: user.login }, scope: authRequest.scope.filter((x) => x === "mcp:read"), props: { githubLogin: user.login, githubId: user.id } }); return new Response(null, { status: 302, headers: { Location: result.redirectTo, "set-cookie": stateCookie("", 0) } }); }
 
 let defaultHandler: ExportedHandler<Env>;
 defaultHandler = { async fetch(request, env) { const url = new URL(request.url); if (url.pathname === "/keys" && request.method === "GET") return await keysPage(env, request); if ((url.pathname === "/keys" || url.pathname === "/keys/login" || url.pathname === "/keys/delete" || url.pathname === "/keys/logout") && request.method === "POST") return keysPost(request, env); if (url.pathname === "/authorize" && request.method === "GET") return authorize(request, env); if (url.pathname === "/callback" && request.method === "GET") return callback(request, env); if (url.pathname === "/") return new Response("Web Bridge MCP"); return new Response("Not found", { status: 404 }); } };
@@ -1012,6 +1377,7 @@ export default {
     const directPath = new URL(request.url).pathname;
     if (directPath === "/favicon.svg" && request.method === "GET") return favicon();
     if (directPath === "/web-bridge-icon.svg" && request.method === "GET") return webBridgeIcon();
+    if (directPath.startsWith("/generated/")) return generatedImage(request, env);
     if (directPath === "/keys" && request.method === "GET") return await keysPage(env, request);
     if ((directPath === "/keys" || directPath === "/keys/login" || directPath === "/keys/delete" || directPath === "/keys/logout") && request.method === "POST") return keysPost(request, env);
 
